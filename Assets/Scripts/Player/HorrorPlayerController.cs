@@ -17,11 +17,13 @@ public class HorrorPlayerController : MonoBehaviour
     [SerializeField] private string lookActionName = "Look";
     [SerializeField] private string sprintActionName = "Sprint";
     [SerializeField] private string crouchActionName = "Crouch";
+    [SerializeField] private string jumpActionName = "Jump";
 
     [Header("Movement")]
     [SerializeField, Min(0f)] private float walkSpeed = 2.2f;
     [SerializeField, Min(0f)] private float sprintSpeed = 4.4f;
     [SerializeField, Min(0f)] private float crouchSpeed = 1.3f;
+    [SerializeField, Min(0f)] private float jumpHeight = 1.2f;
     [SerializeField] private float gravity = -25f;
     [SerializeField] private float groundedForce = -2f;
 
@@ -43,6 +45,16 @@ public class HorrorPlayerController : MonoBehaviour
     [SerializeField, Min(0f)] private float crouchBobMultiplier = 0.7f;
     [SerializeField, Min(0f)] private float bobSmoothing = 12f;
 
+    [Header("Fear Camera Shake")]
+    [SerializeField] private bool enableFearShake = true;
+    [SerializeField, Min(0f)] private float fearShakeStartDistance = 14f;
+    [SerializeField, Min(0f)] private float fearShakeMaxDistance = 3f;
+    [SerializeField, Min(0f)] private float fearShakePositionAmplitude = 0.055f;
+    [SerializeField, Min(0f)] private float fearShakeFrequency = 18f;
+    [SerializeField, Min(0f)] private float chasingShakeMultiplier = 1.7f;
+    [SerializeField, Min(0.01f)] private float fearShakeResponse = 7f;
+    [SerializeField, Min(0.1f)] private float monsterScanInterval = 0.5f;
+
     [Header("Crouch")]
     [SerializeField, Min(0.5f)] private float crouchHeight = 1.05f;
     [SerializeField, Min(1f)] private float crouchTransitionSpeed = 10f;
@@ -63,6 +75,10 @@ public class HorrorPlayerController : MonoBehaviour
     public float StaminaNormalized => maxStamina <= 0f ? 0f : currentStamina / maxStamina;
     public bool IsCrouching => isCrouching;
     public bool IsSprinting => isSprinting;
+    public bool IsMoving => horizontalVelocity.sqrMagnitude > 0.01f;
+    public float StealthVisibilityMultiplier => isCrouching ? 0.45f : 1f;
+    public float NoiseMultiplier => GetNoiseMultiplier();
+    public Vector3 HorizontalVelocity => horizontalVelocity;
 
     private CharacterController characterController;
     private InputActionMap actionMap;
@@ -70,6 +86,7 @@ public class HorrorPlayerController : MonoBehaviour
     private InputAction lookAction;
     private InputAction sprintAction;
     private InputAction crouchAction;
+    private InputAction jumpAction;
     private bool ownsActionMap;
 
     private float standingHeight;
@@ -82,8 +99,13 @@ public class HorrorPlayerController : MonoBehaviour
     private float recoveryDelayTimer;
     private float bobTimer;
     private float idleSwayTimer;
+    private float fearShakeTimer;
+    private float fearShakeIntensity;
+    private float nextMonsterScanTime;
+    private Vector3 horizontalVelocity;
     private bool isCrouching;
     private bool isSprinting;
+    private MonsterEnemyAI[] monsters = System.Array.Empty<MonsterEnemyAI>();
     private readonly Collider[] standUpHits = new Collider[8];
 
     private void Awake()
@@ -199,6 +221,7 @@ public class HorrorPlayerController : MonoBehaviour
         lookAction = actionMap.FindAction(lookActionName, true);
         sprintAction = actionMap.FindAction(sprintActionName, true);
         crouchAction = actionMap.FindAction(crouchActionName, true);
+        jumpAction = actionMap.FindAction(jumpActionName, true);
     }
 
     private void HandleLook()
@@ -245,11 +268,19 @@ public class HorrorPlayerController : MonoBehaviour
             verticalVelocity = groundedForce;
         }
 
+        if (jumpAction != null && jumpAction.WasPressedThisFrame() && characterController.isGrounded && !isCrouching)
+        {
+            verticalVelocity = Mathf.Sqrt(jumpHeight * -2f * gravity);
+        }
+
         verticalVelocity += gravity * Time.deltaTime;
 
         Vector3 velocity = moveDirection * speed;
         velocity.y = verticalVelocity;
         characterController.Move(velocity * Time.deltaTime);
+
+        horizontalVelocity = characterController.velocity;
+        horizontalVelocity.y = 0f;
     }
 
     private void UpdateCrouchTransition()
@@ -276,7 +307,7 @@ public class HorrorPlayerController : MonoBehaviour
 
     private void UpdateHeadBob()
     {
-        if (!enableHeadBob || cameraRoot == null)
+        if (cameraRoot == null)
         {
             return;
         }
@@ -288,7 +319,7 @@ public class HorrorPlayerController : MonoBehaviour
         bool isMovingOnGround = characterController.isGrounded && horizontalVelocity.sqrMagnitude > 0.01f;
         Vector3 targetOffset = Vector3.zero;
 
-        if (isMovingOnGround)
+        if (enableHeadBob && isMovingOnGround)
         {
             float currentSpeed = horizontalVelocity.magnitude;
             float sprintBlend = sprintSpeed > walkSpeed
@@ -311,7 +342,7 @@ public class HorrorPlayerController : MonoBehaviour
             float verticalOffset = Mathf.Abs(Mathf.Sin(bobTimer)) * walkBobVerticalAmplitude * amplitudeMultiplier;
             targetOffset = new Vector3(horizontalOffset, verticalOffset, 0f);
         }
-        else if (enableIdleSway)
+        else if (enableHeadBob && enableIdleSway)
         {
             bobTimer = 0f;
             idleSwayTimer += Time.deltaTime * idleSwayFrequency * Mathf.PI * 2f;
@@ -326,6 +357,8 @@ public class HorrorPlayerController : MonoBehaviour
             bobTimer = 0f;
             idleSwayTimer = 0f;
         }
+
+        targetOffset += GetFearShakeOffset();
 
         Vector3 targetCameraPosition = baseCameraPosition + targetOffset;
         cameraRoot.localPosition = Vector3.Lerp(cameraRoot.localPosition, targetCameraPosition, bobSmoothing * Time.deltaTime);
@@ -410,5 +443,82 @@ public class HorrorPlayerController : MonoBehaviour
     private bool IsUsingGamepad()
     {
         return playerInput != null && playerInput.currentControlScheme == "Gamepad";
+    }
+
+    private Vector3 GetFearShakeOffset()
+    {
+        if (!enableFearShake)
+        {
+            fearShakeIntensity = Mathf.MoveTowards(fearShakeIntensity, 0f, fearShakeResponse * Time.deltaTime);
+            return Vector3.zero;
+        }
+
+        float targetIntensity = GetNearbyMonsterThreat();
+        fearShakeIntensity = Mathf.MoveTowards(fearShakeIntensity, targetIntensity, fearShakeResponse * Time.deltaTime);
+
+        if (fearShakeIntensity <= 0.001f)
+        {
+            return Vector3.zero;
+        }
+
+        fearShakeTimer += Time.deltaTime * fearShakeFrequency;
+        float shakeX = (Mathf.PerlinNoise(fearShakeTimer, 0.17f) - 0.5f) * 2f;
+        float shakeY = (Mathf.PerlinNoise(0.43f, fearShakeTimer) - 0.5f) * 2f;
+
+        return new Vector3(shakeX, shakeY, 0f) * fearShakePositionAmplitude * fearShakeIntensity;
+    }
+
+    private float GetNearbyMonsterThreat()
+    {
+        if (Time.time >= nextMonsterScanTime)
+        {
+            monsters = FindObjectsByType<MonsterEnemyAI>(FindObjectsSortMode.None);
+            nextMonsterScanTime = Time.time + monsterScanInterval;
+        }
+
+        float strongestThreat = 0f;
+
+        for (int i = 0; i < monsters.Length; i++)
+        {
+            MonsterEnemyAI monster = monsters[i];
+
+            if (monster == null || !monster.isActiveAndEnabled)
+            {
+                continue;
+            }
+
+            float distance = Vector3.Distance(transform.position, monster.transform.position);
+
+            if (distance > fearShakeStartDistance)
+            {
+                continue;
+            }
+
+            float distanceThreat = Mathf.InverseLerp(fearShakeStartDistance, fearShakeMaxDistance, distance);
+            float chaseMultiplier = monster.IsChasing ? chasingShakeMultiplier : 1f;
+            strongestThreat = Mathf.Max(strongestThreat, distanceThreat * chaseMultiplier);
+        }
+
+        return Mathf.Clamp01(strongestThreat);
+    }
+
+    private float GetNoiseMultiplier()
+    {
+        if (!IsMoving)
+        {
+            return 0f;
+        }
+
+        if (isCrouching)
+        {
+            return 0.25f;
+        }
+
+        if (isSprinting)
+        {
+            return 1.75f;
+        }
+
+        return 1f;
     }
 }
